@@ -1,0 +1,12 @@
+[
+{
+  "directory": "/home/pnx/calib/utils/CameraCalibration/build",
+  "command": "/usr/bin/c++  -I/home/pnx/calib/utils/CameraCalibration/../../IndustrialCamera/include -I/home/pnx/calib/utils/CameraCalibration/../../Data -I/home/pnx/calib/utils/CameraCalibration/../../Logging/include -isystem /usr/include/opencv4 -g -o CMakeFiles/Camera_Calibration.dir/camera_calibration.cpp.o -c /home/pnx/calib/utils/CameraCalibration/camera_calibration.cpp",
+  "file": "/home/pnx/calib/utils/CameraCalibration/camera_calibration.cpp"
+},
+{
+  "directory": "/home/pnx/calib/utils/CameraCalibration/build",
+  "command": "/usr/bin/c++  -I/home/pnx/calib/utils/CameraCalibration/../../IndustrialCamera/include -I/home/pnx/calib/utils/CameraCalibration/../../Data -I/home/pnx/calib/utils/CameraCalibration/../../Logging/include -isystem /usr/include/opencv4 -g -o CMakeFiles/Camera_Calibration.dir/home/pnx/calib/IndustrialCamera/src/Camera.cpp.o -c /home/pnx/calib/IndustrialCamera/src/Camera.cpp",
+  "file": "/home/pnx/calib/IndustrialCamera/src/Camera.cpp"
+}
+]
