@@ -1,7 +1,15 @@
+// 在头文件部分添加多线程支持库
 #include <iostream>
 #include <string>
 #include <ctime>
 #include <cstdio>
+#include <thread>             // 添加线程支持
+#include <mutex>              // 添加互斥量支持
+#include <condition_variable> // 添加条件变量支持
+#include <queue>              // 添加队列支持
+#include <atomic>             // 添加原子操作支持
+#include <functional>         // 添加函数对象支持
+#include <future>             // 添加future支持
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/utility.hpp>
@@ -14,12 +22,157 @@ using namespace cv;
 using namespace std;
 using namespace hnurm;
 
+// 添加一个简单的线程池实现
+class ThreadPool {
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for(size_t i = 0; i < threads; ++i)
+            workers.emplace_back(
+                [this] {
+                    for(;;) {
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lock(this->queue_mutex);
+                            this->condition.wait(lock,
+                                [this]{ return this->stop || !this->tasks.empty(); });
+                            if(this->stop && this->tasks.empty())
+                                return;
+                            task = std::move(this->tasks.front());
+                            this->tasks.pop();
+                        }
+                        task();
+                    }
+                }
+            );
+    }
+
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args) 
+        -> std::future<typename std::result_of<F(Args...)>::type> {
+        using return_type = typename std::result_of<F(Args...)>::type;
+
+        auto task = std::make_shared< std::packaged_task<return_type()> >(
+                std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+            );
+            
+        std::future<return_type> res = task->get_future();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+
+            // 不要在停止后添加任务
+            if(stop)
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+
+            tasks.emplace([task](){ (*task)(); });
+        }
+        condition.notify_one();
+        return res;
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(std::thread &worker: workers)
+            worker.join();
+    }
+    
+private:
+    // 需要保持追踪线程，以便我们可以join它们
+    std::vector<std::thread> workers;
+    // 任务队列
+    std::queue<std::function<void()>> tasks;
+    
+    // 同步
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    // 线程池停止标志
+    bool stop;
+};
+
+// 线程安全的图像帧队列
+class SafeImageQueue {
+public:
+    SafeImageQueue() : done(false) {}
+    
+    void push(const Mat& image) {
+        std::unique_lock<std::mutex> lock(mtx);
+        frames.push(image.clone());
+        lock.unlock();
+        cond.notify_one();
+    }
+    
+    bool pop(Mat& image) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cond.wait(lock, [this]{ return !frames.empty() || done; });
+        
+        if(frames.empty() && done)
+            return false;
+            
+        image = frames.front();
+        frames.pop();
+        return true;
+    }
+    
+    void setDone() {
+        std::unique_lock<std::mutex> lock(mtx);
+        done = true;
+        lock.unlock();
+        cond.notify_all();
+    }
+    
+    bool isEmpty() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return frames.empty();
+    }
+    
+private:
+    std::queue<Mat> frames;
+    std::mutex mtx;
+    std::condition_variable cond;
+    bool done;
+};
+
+// 线程安全的特征点结果队列
+class SafePointsQueue {
+public:
+    void push(const vector<Point2f>& points) {
+        std::unique_lock<std::mutex> lock(mtx);
+        pointsQueue.push_back(points);
+    }
+    
+    vector<vector<Point2f>> getAll() {
+        std::unique_lock<std::mutex> lock(mtx);
+        vector<vector<Point2f>> result = pointsQueue;
+        return result;
+    }
+    
+    size_t size() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return pointsQueue.size();
+    }
+    
+    // 添加清空方法
+    void clear() {
+        std::unique_lock<std::mutex> lock(mtx);
+        pointsQueue.clear();
+    }
+    
+private:
+    vector<vector<Point2f>> pointsQueue;
+    std::mutex mtx;
+};
+
 class Settings
 {
 public:
     Settings()
     {
         goodInput = false;
+        threadCount = std::thread::hardware_concurrency(); // 默认使用所有可用CPU核心
+        if (threadCount == 0) threadCount = 6; // 如果无法确定硬件并发性，使用6个线程
     }
     enum Pattern { NOT_EXISTING, CHESSBOARD, CIRCLES_GRID, ASYMMETRIC_CIRCLES_GRID };
     enum InputType { INVALID, CAMERA, VIDEO_FILE, IMAGE_LIST };
@@ -224,6 +377,7 @@ public:
     bool fixK3;                  // fix K3 distortion coefficient
     bool fixK4;                  // fix K4 distortion coefficient
     bool fixK5;                  // fix K5 distortion coefficient
+    unsigned int threadCount;
 
     int cameraID;
     vector<string> imageList;
@@ -251,6 +405,34 @@ enum { DETECTION = 0, CAPTURING = 1, CALIBRATED = 2 };
 
 bool runCalibrationAndSave(Settings& s, Size imageSize, Mat&  cameraMatrix, Mat& distCoeffs,
                            vector<vector<Point2f> > imagePoints, float grid_width, bool release_object);
+
+                           bool findChessboardCornersTask(const Mat& view, const Size& boardSize, vector<Point2f>& pointBuf, 
+                            int chessBoardFlags, Settings::Pattern calibrationPattern, int winSize) {
+  bool found = false;
+  
+  switch(calibrationPattern) {
+      case Settings::CHESSBOARD:
+          found = findChessboardCorners(view, boardSize, pointBuf, chessBoardFlags);
+          if (found) {
+              Mat viewGray;
+              cvtColor(view, viewGray, COLOR_BGR2GRAY);
+              cornerSubPix(viewGray, pointBuf, Size(winSize, winSize),
+                          Size(-1, -1), TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 30, 0.0001));
+          }
+          break;
+      case Settings::CIRCLES_GRID:
+          found = findCirclesGrid(view, boardSize, pointBuf);
+          break;
+      case Settings::ASYMMETRIC_CIRCLES_GRID:
+          found = findCirclesGrid(view, boardSize, pointBuf, CALIB_CB_ASYMMETRIC_GRID);
+          break;
+      default:
+          found = false;
+          break;
+  }
+  
+  return found;
+}
 
 int main(int argc, char* argv[])
 {
@@ -298,8 +480,6 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    int winSize = parser.get<int>("winSize");
-
     float grid_width = s.squareSize * (s.boardSize.width - 1);
     bool release_object = false;
     if (parser.has("d")) {
@@ -307,7 +487,18 @@ int main(int argc, char* argv[])
         release_object = true;
     }
 
-    vector<vector<Point2f> > imagePoints;
+    // 创建线程池
+    ThreadPool pool(s.threadCount);
+
+    // 创建安全队列用于存储检测到的特征点
+    SafePointsQueue pointsQueue;
+    
+    // 创建用于显示的结果
+    Mat displayView;
+    std::mutex displayMutex;
+    bool hasNewDisplay = false;
+    
+    vector<vector<Point2f>> imagePoints;
     Mat cameraMatrix, distCoeffs;
     Size imageSize;
     int mode = s.inputType == Settings::IMAGE_LIST ? CAPTURING : DETECTION;
@@ -315,6 +506,12 @@ int main(int argc, char* argv[])
     const Scalar RED(0,0,255), GREEN(0,255,0);
     const char ESC_KEY = 27;
 
+    // 记录正在处理的任务数
+    std::atomic<int> activeTasks(0);
+
+    // 获取窗口大小参数
+    int winSize = parser.get<int>("winSize");
+    
     //! [get_input]
     for(;;)
     {
@@ -324,129 +521,149 @@ int main(int argc, char* argv[])
         view = s.nextImage();
 
         //-----  If no more image, or got enough, then stop calibration and show result -------------
-        if( mode == CAPTURING && imagePoints.size() >= (size_t)s.nrFrames )
+        if(mode == CAPTURING && pointsQueue.size() >= (size_t)s.nrFrames)
         {
-            if (runCalibrationAndSave(s, imageSize, cameraMatrix, distCoeffs, imagePoints, grid_width,
-                                      release_object))
+            // 等待所有任务完成
+            while(activeTasks > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            // 获取所有结果
+            imagePoints = pointsQueue.getAll();
+            
+            if(runCalibrationAndSave(s, imageSize, cameraMatrix, distCoeffs, imagePoints, grid_width, release_object))
                 mode = CALIBRATED;
             else
                 mode = DETECTION;
         }
+        
         if(view.empty())          // If there are no more images stop the loop
         {
-            // if calibration threshold was not reached yet, calibrate now
-            if( mode != CALIBRATED && !imagePoints.empty() )
-                runCalibrationAndSave(s, imageSize,  cameraMatrix, distCoeffs, imagePoints, grid_width,
-                                      release_object);
+            // 等待所有任务完成
+            while(activeTasks > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            // 获取所有结果
+            if(mode != CALIBRATED && !pointsQueue.getAll().empty()) {
+                imagePoints = pointsQueue.getAll();
+                runCalibrationAndSave(s, imageSize, cameraMatrix, distCoeffs, imagePoints, grid_width, release_object);
+            }
             break;
         }
-        //! [get_input]
-
+        
         imageSize = view.size();  // Format input image.
-        if( s.flipVertical )    flip( view, view, 0 );
+        if(s.flipVertical)
+            flip(view, view, 0);
 
-        //! [find_pattern]
-        vector<Point2f> pointBuf;
-
-        bool found;
-
-        int chessBoardFlags = CALIB_CB_ADAPTIVE_THRESH | CALIB_CB_NORMALIZE_IMAGE;
-
-        if(!s.useFisheye) {
-            // fast check erroneously fails with high distortions like fisheye
-            chessBoardFlags |= CALIB_CB_FAST_CHECK;
+        // 为每一帧创建一个工作任务
+        if(mode == CAPTURING || mode == DETECTION) {
+            Mat frameCopy = view.clone(); // 创建副本以确保线程安全
+            activeTasks++;
+            
+            // 提交任务到线程池
+            pool.enqueue([&, frameCopy]() {
+                vector<Point2f> pointBuf;
+                int chessBoardFlags = CALIB_CB_ADAPTIVE_THRESH | CALIB_CB_NORMALIZE_IMAGE;
+                
+                if(!s.useFisheye) {
+                    chessBoardFlags |= CALIB_CB_FAST_CHECK;
+                }
+                
+                bool found = findChessboardCornersTask(frameCopy, s.boardSize, pointBuf, 
+                                                     chessBoardFlags, s.calibrationPattern, winSize);
+                
+                if(found) {
+                    std::unique_lock<std::mutex> displayLock(displayMutex);
+                    
+                    if(mode == CAPTURING) {
+                        pointsQueue.push(pointBuf);
+                        blinkOutput = true;
+                    }
+                    
+                    // 在图像上绘制棋盘格角点
+                    Mat viewCopy = frameCopy.clone();
+                    drawChessboardCorners(viewCopy, s.boardSize, Mat(pointBuf), found);
+                    
+                    string msg;
+                    if(mode == CAPTURING)
+                        msg = format("%d/%d", (int)pointsQueue.size(), s.nrFrames);
+                    else
+                        msg = "Press 'g' to start";
+                    
+                    int baseLine = 0;
+                    Size textSize = getTextSize(msg, 1, 1, 1, &baseLine);
+                    Point textOrigin(viewCopy.cols - 2*textSize.width - 10, viewCopy.rows - 2*baseLine - 10);
+                    
+                    putText(viewCopy, msg, textOrigin, 1, 1, mode == CALIBRATED ? GREEN : RED);
+                    
+                    if(blinkOutput)
+                        bitwise_not(viewCopy, viewCopy);
+                    
+                    displayView = viewCopy;
+                    hasNewDisplay = true;
+                }
+                
+                activeTasks--;
+            });
         }
-
-        switch( s.calibrationPattern ) // Find feature points on the input format
-        {
-            case Settings::CHESSBOARD:
-                found = findChessboardCorners(view, s.boardSize, pointBuf, chessBoardFlags);
-                break;
-            case Settings::CIRCLES_GRID:
-                found = findCirclesGrid(view, s.boardSize, pointBuf);
-                break;
-            case Settings::ASYMMETRIC_CIRCLES_GRID:
-                found = findCirclesGrid(view, s.boardSize, pointBuf, CALIB_CB_ASYMMETRIC_GRID);
-                break;
-            default:
-                found = false;
-                break;
-        }
-        //! [find_pattern]
-        //! [pattern_found]
-        if (found)                // If done with success,
-        {
-            // improve the found corners' coordinate accuracy for chessboard
-            if (s.calibrationPattern == Settings::CHESSBOARD)
-            {
-                Mat viewGray;
-                cvtColor(view, viewGray, COLOR_BGR2GRAY);
-                cornerSubPix(viewGray, pointBuf, Size(winSize, winSize),
-                             Size(-1, -1), TermCriteria(TermCriteria::EPS + TermCriteria::COUNT, 30, 0.0001));
+        
+        // 处理校准后的图像
+        if(mode == CALIBRATED) {
+            if(s.showUndistorsed) {
+                Mat temp = view.clone();
+                if(s.useFisheye)
+                    cv::fisheye::undistortImage(temp, view, cameraMatrix, distCoeffs);
+                else
+                    undistort(temp, view, cameraMatrix, distCoeffs);
             }
-
-            if (mode == CAPTURING &&  // For camera only take new samples after delay time
-                (!true || clock() - prevTimestamp > s.delay * 1e-3 * CLOCKS_PER_SEC))
+            
+            string msg = "Calibrated";
+            int baseLine = 0;
+            Size textSize = getTextSize(msg, 1, 1, 1, &baseLine);
+            Point textOrigin(view.cols - 2*textSize.width - 10, view.rows - 2*baseLine - 10);
+            putText(view, msg, textOrigin, 1, 1, GREEN);
+            
             {
-                imagePoints.push_back(pointBuf);
-                prevTimestamp = clock();
-                blinkOutput = true;
+                std::unique_lock<std::mutex> displayLock(displayMutex);
+                displayView = view.clone();
+                hasNewDisplay = true;
             }
-
-            // Draw the corners.
-            drawChessboardCorners(view, s.boardSize, Mat(pointBuf), found);
         }
-        //! [pattern_found]
-        //----------------------------- Output Text ------------------------------------------------
-        //! [output_text]
-        string msg = (mode == CAPTURING) ? "100/100" :
-                     mode == CALIBRATED ? "Calibrated" : "Press 'g' to start";
-        int baseLine = 0;
-        Size textSize = getTextSize(msg, 1, 1, 1, &baseLine);
-        Point textOrigin(view.cols - 2*textSize.width - 10, view.rows - 2*baseLine - 10);
-
-        if( mode == CAPTURING )
+        
+        // 显示图像
         {
-            if(s.showUndistorsed)
-                msg = format( "%d/%d Undist", (int)imagePoints.size(), s.nrFrames );
-            else
-                msg = format( "%d/%d", (int)imagePoints.size(), s.nrFrames );
+            std::unique_lock<std::mutex> displayLock(displayMutex);
+            if(hasNewDisplay) {
+                namedWindow("Image View", WINDOW_NORMAL);
+                imshow("Image View", displayView);
+                hasNewDisplay = false;
+            } else if(mode == DETECTION) {
+                // 如果没有检测到角点，显示原始图像
+                namedWindow("Image View", WINDOW_NORMAL);
+                
+                string msg = "Press 'g' to start";
+                int baseLine = 0;
+                Size textSize = getTextSize(msg, 1, 1, 1, &baseLine);
+                Point textOrigin(view.cols - 2*textSize.width - 10, view.rows - 2*baseLine - 10);
+                putText(view, msg, textOrigin, 1, 1, RED);
+                
+                imshow("Image View", view);
+            }
         }
-
-        putText( view, msg, textOrigin, 1, 1, mode == CALIBRATED ?  GREEN : RED);
-
-        if( blinkOutput )
-            bitwise_not(view, view);
-        //! [output_text]
-        //------------------------- Video capture  output  undistorted ------------------------------
-        //! [output_undistorted]
-        if( mode == CALIBRATED && s.showUndistorsed )
-        {
-            Mat temp = view.clone();
-            if (s.useFisheye)
-                cv::fisheye::undistortImage(temp, view, cameraMatrix, distCoeffs);
-            else
-                undistort(temp, view, cameraMatrix, distCoeffs);
-        }
-        //! [output_undistorted]
-        //------------------------------ Show image and check for input commands -------------------
-        //! [await_input]
-        namedWindow("Image View", WINDOW_NORMAL);
-        imshow("Image View", view);
-        char key = (char) waitKey(true ? 50 : s.delay);
-
-        if( key  == ESC_KEY )
+        
+        char key = (char)waitKey(50);
+        
+        if(key == ESC_KEY)
             break;
-
-        if( key == 'u' && mode == CALIBRATED )
+            
+        if(key == 'u' && mode == CALIBRATED)
             s.showUndistorsed = !s.showUndistorsed;
-
-        if (true && key == 'g')
-        {
+            
+        if(key == 'g' && mode != CALIBRATED) {
             mode = CAPTURING;
-            imagePoints.clear();
+            pointsQueue.clear(); // 使用新添加的 clear 方法清空队列
         }
-        //! [await_input]
     }
 
     // -----------------------Show the undistorted image for the image list ------------------------

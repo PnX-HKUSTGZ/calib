@@ -47,7 +47,7 @@ nSetBoolValue3: 1
 fExposureTime: 15000.0000
 
 # 增益
-fGainValue: 32
+fGainValue: 10
 
 # 自动增益
 nGainAuto: 0

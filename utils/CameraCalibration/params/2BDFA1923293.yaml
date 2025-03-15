@@ -1,0 +1,18 @@
+%YAML:1.0
+---
+calibration_time: "Sat 15 Mar 2025 02:27:13 PM CST"
+# flags: +fix_aspectRatio +fix_principal_point +zero_tangent_dist +fix_k4 +fix_k5
+flags: 6158
+fisheye_model: 0
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2.3292018356734061e+03, 0., 7.1950000000000000e+02, 0.,
+       2.3292018356734061e+03, 5.3950000000000000e+02, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 5
+   cols: 1
+   dt: d
+   data: [ -5.6839477245969786e-02, 1.1946842036255683e+00, 0., 0.,
+       -1.5307879212359280e+01 ]
