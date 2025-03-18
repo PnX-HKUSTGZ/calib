@@ -518,6 +518,7 @@ int main(int argc, char* argv[])
         Mat view;
         bool blinkOutput = false;
 
+        // 获取当前帧，无论如何都要显示
         view = s.nextImage();
 
         //-----  If no more image, or got enough, then stop calibration and show result -------------
@@ -556,56 +557,69 @@ int main(int argc, char* argv[])
         if(s.flipVertical)
             flip(view, view, 0);
 
-        // 为每一帧创建一个工作任务
-        if(mode == CAPTURING || mode == DETECTION) {
-            Mat frameCopy = view.clone(); // 创建副本以确保线程安全
-            activeTasks++;
+        // 使用当前时间控制校准帧的采集频率
+        static clock_t lastCaptureTime = 0;
+        clock_t currentTime = clock();
+        bool timeToCapture = (currentTime - lastCaptureTime) >= (s.delay * (CLOCKS_PER_SEC/1000));
+
+        // 为每一帧创建一个工作任务，但只有当需要采集且时间到时才实际进行棋盘识别
+        if((mode == CAPTURING || mode == DETECTION) && timeToCapture) {
+            // 如果是捕获模式，更新最后捕获的时间戳
+            if(mode == CAPTURING) {
+                lastCaptureTime = currentTime;
+            }
             
-            // 提交任务到线程池
-            pool.enqueue([&, frameCopy]() {
-                vector<Point2f> pointBuf;
-                int chessBoardFlags = CALIB_CB_ADAPTIVE_THRESH | CALIB_CB_NORMALIZE_IMAGE;
+            // 如果活动任务数量允许，提交新任务
+            if (activeTasks < 3) { // 限制同时处理的帧数
+                Mat frameCopy = view.clone(); // 创建副本以确保线程安全
+                activeTasks++;
                 
-                if(!s.useFisheye) {
-                    chessBoardFlags |= CALIB_CB_FAST_CHECK;
-                }
-                
-                bool found = findChessboardCornersTask(frameCopy, s.boardSize, pointBuf, 
-                                                     chessBoardFlags, s.calibrationPattern, winSize);
-                
-                if(found) {
-                    std::unique_lock<std::mutex> displayLock(displayMutex);
+                // 提交任务到线程池
+                pool.enqueue([&, frameCopy]() {
+                    vector<Point2f> pointBuf;
+                    int chessBoardFlags = CALIB_CB_ADAPTIVE_THRESH | CALIB_CB_NORMALIZE_IMAGE;
                     
-                    if(mode == CAPTURING) {
-                        pointsQueue.push(pointBuf);
-                        blinkOutput = true;
+                    if(!s.useFisheye) {
+                        chessBoardFlags |= CALIB_CB_FAST_CHECK;
                     }
                     
-                    // 在图像上绘制棋盘格角点
-                    Mat viewCopy = frameCopy.clone();
-                    drawChessboardCorners(viewCopy, s.boardSize, Mat(pointBuf), found);
+                    bool found = findChessboardCornersTask(frameCopy, s.boardSize, pointBuf, 
+                                                        chessBoardFlags, s.calibrationPattern, winSize);
                     
-                    string msg;
-                    if(mode == CAPTURING)
-                        msg = format("%d/%d", (int)pointsQueue.size(), s.nrFrames);
-                    else
-                        msg = "Press 'g' to start";
+                    if(found) {
+                        std::unique_lock<std::mutex> displayLock(displayMutex);
+                        
+                        if(mode == CAPTURING) {
+                            pointsQueue.push(pointBuf);
+                            blinkOutput = true;
+                        }
+                        
+                        // 在图像上绘制棋盘格角点
+                        Mat viewCopy = frameCopy.clone();
+                        drawChessboardCorners(viewCopy, s.boardSize, Mat(pointBuf), found);
+                        
+                        string msg;
+                        if(mode == CAPTURING)
+                            msg = format("%d/%d", (int)pointsQueue.size(), s.nrFrames);
+                        else
+                            msg = "Press 'g' to start";
+                        
+                        int baseLine = 0;
+                        Size textSize = getTextSize(msg, 1, 1, 1, &baseLine);
+                        Point textOrigin(viewCopy.cols - 2*textSize.width - 10, viewCopy.rows - 2*baseLine - 10);
+                        
+                        putText(viewCopy, msg, textOrigin, 1, 1, mode == CALIBRATED ? GREEN : RED);
+                        
+                        if(blinkOutput)
+                            bitwise_not(viewCopy, viewCopy);
+                        
+                        displayView = viewCopy;
+                        hasNewDisplay = true;
+                    }
                     
-                    int baseLine = 0;
-                    Size textSize = getTextSize(msg, 1, 1, 1, &baseLine);
-                    Point textOrigin(viewCopy.cols - 2*textSize.width - 10, viewCopy.rows - 2*baseLine - 10);
-                    
-                    putText(viewCopy, msg, textOrigin, 1, 1, mode == CALIBRATED ? GREEN : RED);
-                    
-                    if(blinkOutput)
-                        bitwise_not(viewCopy, viewCopy);
-                    
-                    displayView = viewCopy;
-                    hasNewDisplay = true;
-                }
-                
-                activeTasks--;
-            });
+                    activeTasks--;
+                });
+            }
         }
         
         // 处理校准后的图像
@@ -652,7 +666,8 @@ int main(int argc, char* argv[])
             }
         }
         
-        char key = (char)waitKey(50);
+        // 使用较短的延时确保界面响应流畅
+        char key = (char)waitKey(10);  // 固定使用较短的等待时间，确保UI响应及时
         
         if(key == ESC_KEY)
             break;
